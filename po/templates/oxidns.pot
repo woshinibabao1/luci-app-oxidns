@@ -2056,3 +2056,27 @@ msgstr ""
 msgid "A new sequence named %s will be created."
 msgstr ""
 
+msgid "Refreshing..."
+msgstr ""
+
+msgid "Updated at %s"
+msgstr ""
+
+msgid "dnsmasq forwards every query to OxiDNS. Servers used before enabling: %s."
+msgstr ""
+
+msgid "dnsmasq forwards every query to OxiDNS."
+msgstr ""
+
+msgid "Servers from %s are added automatically from the WAN connection and are not stored in UCI."
+msgstr ""
+
+msgid "noresolv is set, so servers from the resolv file are ignored."
+msgstr ""
+
+msgid "Stop using the WAN-provided servers in %s."
+msgstr ""
+
+msgid "No domain-specific upstreams are configured, so every domain uses the upstreams above."
+msgstr ""
+

@@ -33,6 +33,15 @@ var serviceActionsKey = null;
 var dnsIntegrationState = {};
 var dnsIntegrationBusy = false;
 var dnsIntegrationKey = null;
+var dnsIntegrationInFlight = null;
+var dnsIntegrationUpdatedAt = null;
+var dnsIntegrationRefreshing = false;
+var statusRefreshInFlight = null;
+
+/* The DNS card follows dnsmasq, which the user may change from another LuCI
+ * page or over SSH. Poll it on its own short interval instead of waiting for
+ * the heavier status call, so the card converges within a few seconds. */
+var DNS_POLL_SECONDS = 3;
 
 function valueOrDash(value) {
 	if (value === null || value === undefined || value === '')
@@ -358,6 +367,30 @@ function dnsServerListText(values) {
 	return values.join(', ');
 }
 
+/* dnsmasq resolves through two sources: explicit `server` options in UCI and
+ * the nameservers of its resolv file, which the WAN connection rewrites. Only
+ * reporting the UCI list made the card read "None" on routers where the ISP
+ * supplies the upstreams, so merge both into the effective list. */
+function dnsEffectiveUpstreams(state) {
+	var list = [];
+
+	if (!state || !state.supported)
+		return list;
+
+	(state.generic_servers || []).forEach(function(value) {
+		if (value)
+			list.push(value);
+	});
+	if (state.auto_active) {
+		(state.auto_servers || []).forEach(function(value) {
+			if (value)
+				list.push(value);
+		});
+	}
+
+	return list;
+}
+
 function dnsIntegrationBadge(state) {
 	if (!state || state.ok === false || !state.supported)
 		return statusBadge(_('Unavailable'), false);
@@ -384,14 +417,50 @@ function dnsIntegrationUpstreamText(state) {
 	if (!state || !state.supported)
 		return '-';
 	if (state.managed)
-		return dnsServerListText(state.previous_servers);
-	return dnsServerListText(state.generic_servers);
+		return state.forward || _('None');
+
+	var list = dnsEffectiveUpstreams(state);
+	return list.length ? list.join(', ') : _('None');
+}
+
+function dnsIntegrationUpstreamHint(state) {
+	if (!state || !state.supported)
+		return '';
+
+	if (state.managed) {
+		if (Array.isArray(state.previous_servers) && state.previous_servers.length)
+			return _('dnsmasq forwards every query to OxiDNS. Servers used before enabling: %s.')
+				.format(state.previous_servers.join(', '));
+		return _('dnsmasq forwards every query to OxiDNS.');
+	}
+
+	if (state.auto_active && state.auto_source)
+		return _('Servers from %s are added automatically from the WAN connection and are not stored in UCI.')
+			.format(state.auto_source);
+
+	if (state.noresolv_set && state.noresolv === '1')
+		return _('noresolv is set, so servers from the resolv file are ignored.');
+
+	return '';
 }
 
 function dnsIntegrationDomainText(state) {
 	if (!state || !state.supported)
 		return '-';
 	return dnsServerListText(state.domain_servers);
+}
+
+function dnsIntegrationDomainCell(state) {
+	if (!state || !state.supported)
+		return dnsIntegrationDomainText(state);
+	if (Array.isArray(state.domain_servers) && state.domain_servers.length)
+		return dnsIntegrationDomainText(state);
+
+	return E('div', {}, [
+		E('div', {}, _('None')),
+		E('div', { 'class': 'cbi-value-description' },
+			_('No domain-specific upstreams are configured, so every domain uses the upstreams above.'))
+	]);
 }
 
 function dnsIntegrationNote(state) {
@@ -411,17 +480,49 @@ function dnsIntegrationNote(state) {
 		_('When enabled, dnsmasq forwards generic DNS queries to OxiDNS. Domain-specific upstreams are kept.');
 }
 
+function dnsIntegrationUpstreamCell(state) {
+	var text = dnsIntegrationUpstreamText(state);
+	var hint = dnsIntegrationUpstreamHint(state);
+
+	if (!hint)
+		return text;
+
+	return E('div', {}, [
+		E('div', {}, text),
+		E('div', { 'class': 'cbi-value-description' }, hint)
+	]);
+}
+
 function dnsIntegrationRows(state) {
 	return [
 		renderRow(_('dnsmasq'), dnsmasqStatusBadge(state), 'oxidns-dnsmasq-status'),
 		renderRow(_('DNS integration'), dnsIntegrationBadge(state), 'oxidns-dns-integration-badge'),
 		renderRow(_('OxiDNS DNS listener'), dnsIntegrationTargetText(state), 'oxidns-dns-integration-target'),
-		renderRow(_('dnsmasq upstream'), dnsIntegrationUpstreamText(state), 'oxidns-dns-integration-upstream'),
-		renderRow(_('Domain-specific upstreams'), dnsIntegrationDomainText(state), 'oxidns-dns-integration-domain'),
+		renderRow(_('dnsmasq upstream'), dnsIntegrationUpstreamCell(state), 'oxidns-dns-integration-upstream'),
+		renderRow(_('Domain-specific upstreams'), dnsIntegrationDomainCell(state), 'oxidns-dns-integration-domain'),
 		renderRow(_('dnsmasq noresolv'),
 			state && state.noresolv_set ? state.noresolv : '-',
 			'oxidns-dns-integration-noresolv')
 	];
+}
+
+function dnsIntegrationRefreshButton() {
+	return E('button', {
+		'id': 'oxidns-dns-integration-refresh',
+		'class': 'btn cbi-button cbi-button-neutral',
+		'type': 'button',
+		'click': function(ev) {
+			ev.preventDefault();
+			if (dnsIntegrationRefreshing)
+				return Promise.resolve();
+			dnsIntegrationRefreshing = true;
+			updateDnsIntegrationUpdatedAt();
+			return refreshDnsIntegration().then(function() {
+				dnsIntegrationRefreshing = false;
+				updateDnsIntegrationUpdatedAt();
+			});
+		}
+	}, _('Refresh'));
 }
 
 function dnsIntegrationButtons(state) {
@@ -464,6 +565,8 @@ function dnsIntegrationButtons(state) {
 		actions.push(button);
 	}
 
+	actions.push(dnsIntegrationRefreshButton());
+
 	return actions;
 }
 
@@ -487,6 +590,27 @@ function dnsIntegrationStateKey(state) {
 	}
 }
 
+function padClockValue(value) {
+	return (value < 10 ? '0' : '') + value;
+}
+
+function dnsIntegrationUpdatedText() {
+	if (dnsIntegrationRefreshing)
+		return _('Refreshing...');
+	if (!dnsIntegrationUpdatedAt)
+		return '';
+	return _('Updated at %s').format('%s:%s:%s'.format(
+		padClockValue(dnsIntegrationUpdatedAt.getHours()),
+		padClockValue(dnsIntegrationUpdatedAt.getMinutes()),
+		padClockValue(dnsIntegrationUpdatedAt.getSeconds())));
+}
+
+function updateDnsIntegrationUpdatedAt() {
+	var node = document.getElementById('oxidns-dns-integration-updated');
+	if (node)
+		node.textContent = dnsIntegrationUpdatedText();
+}
+
 function updateDnsIntegration() {
 	var node = document.getElementById('oxidns-dns-integration-body');
 	if (!node)
@@ -503,6 +627,27 @@ function updateDnsIntegration() {
 	replaceContent(node, dnsIntegrationBody(dnsIntegrationState));
 }
 
+/* Guarded so the 3 s poll and the manual Refresh button never stack requests.
+ * The timestamp only advances on success, so a stale card is visible. A forced
+ * refresh ignores the guard: after enabling or disabling forwarding a request
+ * that started earlier may still describe the previous state. */
+function refreshDnsIntegration(force) {
+	if (dnsIntegrationInFlight && !force)
+		return dnsIntegrationInFlight;
+
+	dnsIntegrationInFlight = L.resolveDefault(callDnsIntegrationStatus(), null).then(function(result) {
+		dnsIntegrationInFlight = null;
+		if (!result || typeof result !== 'object')
+			return;
+		dnsIntegrationState = result;
+		dnsIntegrationUpdatedAt = new Date();
+		updateDnsIntegration();
+		updateDnsIntegrationUpdatedAt();
+	});
+
+	return dnsIntegrationInFlight;
+}
+
 function confirmDnsIntegration(action) {
 	var state = dnsIntegrationState || {};
 	var title = action === 'enable'
@@ -517,6 +662,8 @@ function confirmDnsIntegration(action) {
 			E('li', {}, _('Set dnsmasq noresolv to 1.')),
 			E('li', {}, _('Keep domain-specific upstream servers unchanged: %s.').format(dnsServerListText(state.domain_servers)))
 		];
+		if (state.auto_active && state.auto_source)
+			items.push(E('li', {}, _('Stop using the WAN-provided servers in %s.').format(state.auto_source)));
 	}
 	else {
 		items = [
@@ -573,6 +720,7 @@ function handleDnsIntegrationAction(action) {
 
 		dnsIntegrationBusy = true;
 		updateDnsIntegration();
+		updateDnsIntegrationUpdatedAt();
 		ui.showModal(_('System DNS integration'), [
 			E('p', {}, _('Applying DNS integration...'))
 		]);
@@ -594,24 +742,29 @@ function handleDnsIntegrationAction(action) {
 					: _('System DNS integration disabled.')), 'info');
 			}
 
-			return refreshStatus();
+			return refreshStatus(true);
 		}).catch(function(err) {
 			ui.hideModal();
 			dnsIntegrationBusy = false;
 			ui.addNotification(null, E('p', {},
 				(err && err.message) || String(err)), 'danger');
-			return refreshStatus();
+			return refreshStatus(true);
 		});
 	});
 }
 
-function refreshStatus() {
-	return Promise.all([
+/* A slow router can take longer than the poll interval to answer, and stacking
+ * status requests keeps the backend busy in a loop. Only one may run at a time. */
+function refreshStatus(forceDns) {
+	if (statusRefreshInFlight && !forceDns)
+		return statusRefreshInFlight;
+
+	statusRefreshInFlight = Promise.all([
 		L.resolveDefault(callStatus(), {}),
-		L.resolveDefault(callDnsIntegrationStatus(), {})
+		refreshDnsIntegration(forceDns)
 	]).then(function(results) {
+		statusRefreshInFlight = null;
 		statusState = results[0] || {};
-		dnsIntegrationState = results[1] || {};
 
 		var fields = {
 			'oxidns-backend-status': backendStatusBadge(statusState),
@@ -631,8 +784,9 @@ function refreshStatus() {
 		});
 
 		updateServiceActions(statusState);
-		updateDnsIntegration();
 	});
+
+	return statusRefreshInFlight;
 }
 
 return view.extend({
@@ -676,7 +830,9 @@ return view.extend({
 
 		serviceActionsKey = serviceActionStateKey(statusState);
 		dnsIntegrationKey = dnsIntegrationStateKey(dnsIntegrationState);
+		dnsIntegrationUpdatedAt = new Date();
 		poll.add(refreshStatus, 5);
+		poll.add(refreshDnsIntegration, DNS_POLL_SECONDS);
 
 		return E('div', { 'class': 'cbi-map' }, [
 			E('div', { 'class': 'cbi-section' }, [
@@ -695,10 +851,13 @@ return view.extend({
 			]),
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('System DNS integration')),
-				E('div', {
-					'class': 'cbi-section-descr',
-					'id': 'oxidns-dns-integration-note'
-				}, dnsIntegrationNote(dnsIntegrationState)),
+				E('div', { 'class': 'cbi-section-descr' }, [
+					E('span', { 'id': 'oxidns-dns-integration-note' }, dnsIntegrationNote(dnsIntegrationState)),
+					E('span', {
+						'id': 'oxidns-dns-integration-updated',
+						'style': 'margin-inline-start: .75em; opacity: .75;'
+					}, dnsIntegrationUpdatedText())
+				]),
 				E('div', { 'id': 'oxidns-dns-integration-body' }, dnsIntegrationBody(dnsIntegrationState))
 			])
 		]);

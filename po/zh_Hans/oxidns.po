@@ -2058,3 +2058,27 @@ msgstr "当前配置通过 include 引入外部插件，无法在这里创建。
 msgid "A new sequence named %s will be created."
 msgstr "将创建名为 %s 的新 sequence。"
 
+msgid "Refreshing..."
+msgstr "刷新中…"
+
+msgid "Updated at %s"
+msgstr "更新于 %s"
+
+msgid "dnsmasq forwards every query to OxiDNS. Servers used before enabling: %s."
+msgstr "dnsmasq 将所有查询转发到 OxiDNS。启用前的上游：%s。"
+
+msgid "dnsmasq forwards every query to OxiDNS."
+msgstr "dnsmasq 将所有查询转发到 OxiDNS。"
+
+msgid "Servers from %s are added automatically from the WAN connection and are not stored in UCI."
+msgstr "来自 %s 的上游由 WAN 连接自动写入，未保存在 UCI 中。"
+
+msgid "noresolv is set, so servers from the resolv file are ignored."
+msgstr "已设置 noresolv，resolv 文件中的上游将被忽略。"
+
+msgid "Stop using the WAN-provided servers in %s."
+msgstr "停止使用 %s 中由 WAN 提供的上游。"
+
+msgid "No domain-specific upstreams are configured, so every domain uses the upstreams above."
+msgstr "未配置特定域名上游，所有域名都使用上面的上游。"
+
